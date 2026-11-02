@@ -88,6 +88,26 @@ coding agent, so it is written for agents first and people second.
 
 ## Log (newest first)
 
+### 2026-11-02 Windows compatibility: native support without workarounds (Claude, blockchaindad fork)
+Branch: `cursor/windows-compatibility-c10c` (commit 7283a78). PR in fork: https://github.com/blockchaindad/dogecoin-arcade/pull/1
+(cross-repo PR to upstream not possible with current permissions).
+
+Upstream fix for running DogecoinArcade natively on Windows 11, replacing the local workarounds the owner was using:
+
+- **arcade/filelock.py** (new): Cross-platform file locking. Uses fcntl on Unix, msvcrt.locking on Windows.
+  Updated supervisor.py, xchain.py to use it. Linux/macOS unchanged.
+- **arcade/ssl_context.py** (new): SSL context with certifi certificates for Windows Python.
+  Added certifi dependency. Updated installer and update.py. Fixes SSL verification failures.
+- **Signal handling**: Platform guards in supervisor.py, app.py, core_install.py. Supervisor auto-skips on
+  Windows (no ARCADE_NO_SUPERVISOR=1 needed).
+- **cloudflared**: Check Windows paths (Program Files, WinGet Links). Updated tunnel.py, __main__.py.
+- **Text encoding**: Explicit encoding='utf-8' on template read_text() calls. Fixes cp1252 issues.
+- **Download retries**: Exponential backoff in installer for network failures.
+
+Issues NOT fixed: functools circular import (no shadow file found; likely transient).
+
+Tests: 50/50 installer, 389/391 smoke (2 pre-existing doc failures).
+
 ### 2026-11-02 A fresh install: Pepecoin testnet only, and it meets its first peer at once (Claude, Riffs session)
 The operator: "When somebody first installs arcade, I don't want them to be prompted to install any of the block chains except
 for Pepe test. It should first connect to the UDP network ... before their arcade is published via the mesh ID ... and
