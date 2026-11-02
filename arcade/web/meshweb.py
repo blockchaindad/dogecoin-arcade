@@ -294,7 +294,7 @@ def register(app, state, content=None) -> None:
     @app.get("/browser", response_class=HTMLResponse)
     @app.get("/browser/{address:path}", response_class=HTMLResponse)
     def browser(address: str = ""):
-        return HTMLResponse(BROWSER_FILE.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse(BROWSER_FILE.read_text(encoding="utf-8"), headers={"Cache-Control": "no-cache"})
 
     # --- in a browser ---------------------------------------------------------------------------------------------
 

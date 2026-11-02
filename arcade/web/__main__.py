@@ -45,6 +45,29 @@ def _more_open_files() -> None:
         pass
 
 
+def _find_cloudflared() -> str | None:
+    """Find cloudflared binary, checking platform-specific paths."""
+    import platform
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    if platform.system() == "Windows":
+        candidates = []
+        for envvar in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            base = os.environ.get(envvar)
+            if base:
+                candidates.append(Path(base) / "cloudflared" / "cloudflared.exe")
+        localappdata = os.environ.get("LOCALAPPDATA")
+        if localappdata:
+            candidates.append(Path(localappdata) / "Microsoft" / "WinGet" / "Links" / "cloudflared.exe")
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return None
+    local = os.path.expanduser("~/.local/bin/cloudflared")
+    return local if os.path.exists(local) else None
+
+
 def main(argv: list[str] | None = None) -> int:
     _more_open_files()
     parser = argparse.ArgumentParser(prog="arcade-web", description=__doc__)
@@ -135,8 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ready-fd", type=int, help=argparse.SUPPRESS)
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
-    if args.worker_fd is None and not os.environ.get("ARCADE_NO_SUPERVISOR"):
+    if args.worker_fd is None and not os.environ.get("ARCADE_NO_SUPERVISOR") and sys.platform != "win32":
         # Updates with no downtime (2026-10-20): this process holds the port and runs the arcade as its child.
+        # On Windows the supervisor is not supported (requires Unix signals and process control).
         from .supervisor import Supervisor
         return Supervisor(raw_argv, args.host, args.port, Path(args.home).expanduser()).run()
     from .app import create_app
@@ -322,9 +346,7 @@ def main(argv: list[str] | None = None) -> int:
                 peers=mesh_peers(args.mesh_peer, home),
                 announce_at=peer_address(args.mesh_announce) if args.mesh_announce else None,
                 public_port=args.mesh_public_port, max_inbound=args.mesh_inbound,
-                tunnel=(shutil.which("cloudflared") or next((p for p in (os.path.expanduser("~/.local/bin/cloudflared"),)
-                                                             if os.path.exists(p)), None))
-                if args.mesh_tunnel == "auto" and args.mesh_port else None,
+                tunnel=_find_cloudflared() if args.mesh_tunnel == "auto" and args.mesh_port else None,
                 core=args.mesh_core == "on", web_port=args.port, stun_port=args.stun_port or None,
             ).start()
             print(f"  mesh node {state.mesh.node_id[:16]}"
@@ -394,7 +416,7 @@ def mesh_peers(given: list[str], home: Path) -> list[tuple[str, int]]:
     out: list[tuple[str, int]] = []
     texts = list(given)
     try:
-        texts += [l for l in (home / FIRST_PEER_FILE).read_text().split() if l]
+        texts += [l for l in (home / FIRST_PEER_FILE).read_text(encoding="utf-8").split() if l]
     except OSError:
         pass
     for text in texts:

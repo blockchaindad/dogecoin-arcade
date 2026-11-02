@@ -269,24 +269,45 @@ def _request(url: str):
     return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
 
-def download(url: str, dest: Path, label: str) -> Path:
+def download(url: str, dest: Path, label: str, retries: int = 3) -> Path:
+    """Download a file with retry logic for network errors.
+
+    On Windows, we try to use certifi for SSL certificates if available.
+    Retries with exponential backoff on network failures.
+    """
+    import time
+
+    ctx = _get_ssl_context()
     info(f"downloading {label}")
-    try:
-        with urllib.request.urlopen(_request(url), timeout=120) as response, \
-                dest.open("wb") as out:
-            total = int(response.headers.get("Content-Length", 0))
-            read = 0
-            while chunk := response.read(64 * 1024):
-                out.write(chunk)
-                read += len(chunk)
-                if total:
-                    pct = read * 100 // total
-                    print(f"\r      {label}  {pct:3d}%  {read // 1024:,} KB", end="", flush=True)
-        if total:
-            print(flush=True)
-    except urllib.error.URLError as exc:
-        fail(f"could not download {url}: {exc}")
-    return dest
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            req = _request(url)
+            kwargs = {"timeout": 120}
+            if ctx is not None:
+                kwargs["context"] = ctx
+            with urllib.request.urlopen(req, **kwargs) as response, \
+                    dest.open("wb") as out:
+                total = int(response.headers.get("Content-Length", 0))
+                read = 0
+                while chunk := response.read(64 * 1024):
+                    out.write(chunk)
+                    read += len(chunk)
+                    if total:
+                        pct = read * 100 // total
+                        print(f"\r      {label}  {pct:3d}%  {read // 1024:,} KB", end="", flush=True)
+            if total:
+                print(flush=True)
+            return dest
+        except (urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                warn(f"download failed ({exc}), retrying in {wait}s...")
+                time.sleep(wait)
+                dest.unlink(missing_ok=True)
+    fail(f"could not download {url} after {retries} attempts: {last_exc}")
+    return dest  # unreachable, but keeps type checkers happy
 
 
 def sha256_of(path: Path) -> str:
@@ -1187,15 +1208,31 @@ BOOTSTRAP_WAIT = 600
 BOOTSTRAP_POLL = 30
 
 
+def _get_ssl_context():
+    """Get an SSL context, using certifi if available (helps on Windows)."""
+    import ssl
+    try:
+        import certifi
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(certifi.where())
+        return ctx
+    except ImportError:
+        return None
+
+
 def bootstrap_manifest(net: str) -> str:
     """The manifest of one chain's index copy. An arcade making its first copy says so (503) rather than making it
     inside the request; for the message chain that copy is worth minutes of waiting, against reading the whole testnet
     from block zero."""
     import time as _time
     url, waited = f"{BOOTSTRAP_URL}/{net}.json", 0
+    ctx = _get_ssl_context()
+    kwargs = {"timeout": 60}
+    if ctx is not None:
+        kwargs["context"] = ctx
     while True:
         try:
-            with urllib.request.urlopen(_request(url), timeout=60) as response:
+            with urllib.request.urlopen(_request(url), **kwargs) as response:
                 return response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             if exc.code != 503 or waited >= BOOTSTRAP_WAIT:
@@ -1210,8 +1247,12 @@ def bootstrap_manifest(net: str) -> str:
 
 def read_url(url: str, label: str, quiet: bool = False) -> str:
     """Fetch a small text file. Returns "" when it is not there and quiet."""
+    ctx = _get_ssl_context()
+    kwargs = {"timeout": 60}
+    if ctx is not None:
+        kwargs["context"] = ctx
     try:
-        with urllib.request.urlopen(_request(url), timeout=60) as response:
+        with urllib.request.urlopen(_request(url), **kwargs) as response:
             return response.read().decode("utf-8", "replace")
     except urllib.error.URLError as exc:
         if quiet:

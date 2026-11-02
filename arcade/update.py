@@ -33,6 +33,7 @@ import urllib.request
 from pathlib import Path
 
 from . import release as releaselib
+from .ssl_context import get_ssl_context
 
 REPO_URL = "https://dogecoinarcade.com/repo"
 #: The archive the installer falls back to when there is no git (see
@@ -207,8 +208,12 @@ def _published_revision(url: str = REVISION_URL) -> str | None:
     """The revision named beside the source archive. No git needed."""
     import urllib.error
     import urllib.request
+    ctx = get_ssl_context()
+    kwargs = {"timeout": 30}
+    if ctx is not None:
+        kwargs["context"] = ctx
     try:
-        with urllib.request.urlopen(_request(url), timeout=30) as response:
+        with urllib.request.urlopen(_request(url), **kwargs) as response:
             return response.read().decode("utf-8", "replace").strip()[:7] or None
     except (urllib.error.URLError, OSError):
         return None
@@ -374,8 +379,12 @@ def _signed_manifest(channel: str = "live") -> dict:
     cannot attribute is a website with a shell on every machine (D-065).
     """
     url = TEST_MANIFEST_URL if channel == "test" else MANIFEST_URL
+    ctx = get_ssl_context()
+    kwargs = {"timeout": 30}
+    if ctx is not None:
+        kwargs["context"] = ctx
     try:
-        with urllib.request.urlopen(_request(url), timeout=30) as response:
+        with urllib.request.urlopen(_request(url), **kwargs) as response:
             body = response.read().decode("utf-8", "replace")
     except urllib.error.URLError as exc:
         raise UpdateError(

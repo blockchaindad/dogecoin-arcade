@@ -1088,7 +1088,7 @@ class AppState:
         if getattr(self, "_update_status", None):
             return self._update_status
         try:
-            return json.loads((self.home / self.STATUS_FILE).read_text())
+            return json.loads((self.home / self.STATUS_FILE).read_text(encoding="utf-8"))
         except Exception:
             return None
 
@@ -1338,7 +1338,7 @@ class AppState:
         cached = getattr(self, "_settings_cached", None)
         if cached is None or cached[0] != key:
             try:
-                cached = (key, json.loads(path.read_text()))
+                cached = (key, json.loads(path.read_text(encoding="utf-8")))
             except Exception:
                 return dict(cached[1]) if cached else {}
             self._settings_cached = cached
@@ -1362,7 +1362,7 @@ class AppState:
             data = None
             for attempt in range(10):
                 try:
-                    data = json.loads(path.read_text()) if path.exists() else {}
+                    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
                     break
                 except (OSError, ValueError):
                     time.sleep(0.05 * (attempt + 1))
@@ -1594,7 +1594,7 @@ class AppState:
         """
         if self._token_chain is None:
             try:
-                self._token_chain = self.token_chain_path.read_text().strip()
+                self._token_chain = self.token_chain_path.read_text(encoding="utf-8").strip()
             except OSError:
                 self._token_chain = self.messaging.network
         for chain in self.token_chains:

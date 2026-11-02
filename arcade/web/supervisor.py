@@ -22,7 +22,6 @@ the same port, the old worker still its child).
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import signal
@@ -30,6 +29,10 @@ import socket
 import sys
 import time
 from pathlib import Path
+
+from ..filelock import flock, LOCK_EX, LOCK_NB, LOCK_UN
+
+IS_WINDOWS = sys.platform == "win32"
 
 #: Seconds a new worker has to say it is warm before the reload is given up (the old one keeps serving).
 WARM_SECONDS = 600
@@ -54,7 +57,7 @@ def pidfile(home: Path) -> Path:
 def running(home: Path) -> int | None:
     """The supervisor serving this arcade home, if one is alive."""
     try:
-        pid = int(pidfile(home).read_text().strip())
+        pid = int(pidfile(home).read_text(encoding="utf-8").strip())
         os.kill(pid, 0)
         return pid
     except (OSError, ValueError):
@@ -64,6 +67,8 @@ def running(home: Path) -> int | None:
 def reload(home: Path) -> bool:
     """Ask this home's supervisor for a reload with no downtime. False when none runs (an arcade from before the
     supervisor: restart it the old way, once, and it has one from then on)."""
+    if IS_WINDOWS:
+        return False
     pid = running(home)
     if pid is None:
         return False
@@ -85,7 +90,7 @@ class RunLock:
 
     def take(self, wait: bool = True) -> bool:
         try:
-            fcntl.flock(self._f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            flock(self._f, LOCK_EX | (0 if wait else LOCK_NB))
             return True
         except BlockingIOError:
             return False
