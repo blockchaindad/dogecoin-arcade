@@ -77,6 +77,23 @@ class Wizard:
         found = self._which("cloudflared")
         if found:
             return found
+        # Check platform-specific default install paths
+        if platform.system() == "Windows":
+            # Common Windows install locations for cloudflared
+            candidates = []
+            for envvar in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+                base = os.environ.get(envvar)
+                if base:
+                    candidates.append(Path(base) / "cloudflared" / "cloudflared.exe")
+            # WinGet installs to Links directory
+            localappdata = os.environ.get("LOCALAPPDATA")
+            if localappdata:
+                candidates.append(Path(localappdata) / "Microsoft" / "WinGet" / "Links" / "cloudflared.exe")
+            for candidate in candidates:
+                if candidate.exists():
+                    return str(candidate)
+            return None
+        # Unix: ~/.local/bin/cloudflared
         local = self.home / ".local" / "bin" / "cloudflared"
         return str(local) if local.exists() else None
 

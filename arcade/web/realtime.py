@@ -500,6 +500,6 @@ def register(app, state, *, account_view: Callable, signed_in: Callable,
     def r_realtime_js():
         """The page's half: `arcade.realtime`. Same for every page, like storage.js."""
         from . import content as contentlib
-        body = (TEMPLATE_DIR / "realtime.js").read_text()
+        body = (TEMPLATE_DIR / "realtime.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})

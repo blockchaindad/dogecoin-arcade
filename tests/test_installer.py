@@ -354,10 +354,11 @@ def published(tmp_path, monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    def fake_urlopen(url, timeout=None):
+    def fake_urlopen(url, timeout=None, context=None):
         # A Request now, not a string: every fetch names itself, because the
         # site's zone refuses Python-urllib's default header with a 403 that
-        # no installation could act on (D-066).
+        # no installation could act on (D-066). The context parameter is for
+        # SSL (used on Windows with certifi).
         where = getattr(url, "full_url", url)
         assert "DogecoinArcade" in getattr(url, "headers", {}).get("User-agent", ""), \
             "a program that downloads software should say what it is"
@@ -456,7 +457,7 @@ def test_the_published_revision_needs_no_git(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=None: FakeResponse())
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=None, context=None: FakeResponse())
     assert update.remote_revision() == "7113d88"
 
 

@@ -1218,7 +1218,7 @@ def create_app(state: AppState) -> FastAPI:
         kept = _asset_kept.get(path)
         if kept and kept[0] == mark:
             return kept[1], mark
-        body = _versioned((TEMPLATE_DIR / ASSETS[path]).read_text())
+        body = _versioned((TEMPLATE_DIR / ASSETS[path]).read_text(encoding="utf-8"))
         _asset_kept[path] = (mark, body)
         return body, mark
 
@@ -8348,7 +8348,7 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/r/groups.js")
     def r_groups_js():
         """The shim an inscribed page loads: arcade.groups, the signed-in player's group chats (2026-10-31)."""
-        body = (TEMPLATE_DIR / "groups.js").read_text()
+        body = (TEMPLATE_DIR / "groups.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8356,7 +8356,7 @@ def create_app(state: AppState) -> FastAPI:
     def r_contacts_js():
         """The contacts shim an inscribed page loads: arcade.contacts.list(), the
         signed-in player's address book, read-only, asked once per game (2026-10-06)."""
-        body = (TEMPLATE_DIR / "contacts.js").read_text()
+        body = (TEMPLATE_DIR / "contacts.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8364,7 +8364,7 @@ def create_app(state: AppState) -> FastAPI:
     def r_llm_js():
         """The LLM shim an inscribed page loads: arcade.llm.offers() and arcade.llm.chat(), paid from the signed-in
         player's prepaid credit with a seller (arcade/llm.py, 2026-10-23)."""
-        body = (TEMPLATE_DIR / "llm.js").read_text()
+        body = (TEMPLATE_DIR / "llm.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8373,7 +8373,7 @@ def create_app(state: AppState) -> FastAPI:
         """The access shim an inscribed page loads (2026-10-23): arcade.access.status(), wallet() -- wallet access
         asked over the game, the same card as the game card's switch -- nodes() and move(), playing on another
         arcade. The viewer answers (_page_doors, the 'access' door)."""
-        body = (TEMPLATE_DIR / "access.js").read_text()
+        body = (TEMPLATE_DIR / "access.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8382,7 +8382,7 @@ def create_app(state: AppState) -> FastAPI:
         """The app shim an inscribed page loads (2026-10-24): arcade.app.on(fn) -- told when the installed app's home
         screen minimizes it, restores it, or is about to close it (its card's "minimized" timeout) -- and
         arcade.app.state(). The viewer answers (_page_doors, the 'app' door)."""
-        body = (TEMPLATE_DIR / "app_js.js").read_text()
+        body = (TEMPLATE_DIR / "app_js.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8393,7 +8393,7 @@ def create_app(state: AppState) -> FastAPI:
         Served as a script, with CORS, cached for an hour: it is the same for
         every page and changes only with the wallet.
         """
-        body = (TEMPLATE_DIR / "storage.js").read_text()
+        body = (TEMPLATE_DIR / "storage.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8438,7 +8438,7 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/r/node.js")
     def r_node_js():
         """The node-to-node shim an inscribed page loads (see nodetalk.py)."""
-        body = (TEMPLATE_DIR / "node.js").read_text()
+        body = (TEMPLATE_DIR / "node.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8543,7 +8543,7 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.get("/r/swap.js")
     def r_swap_js():
-        body = (TEMPLATE_DIR / "swap.js").read_text()
+        body = (TEMPLATE_DIR / "swap.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -8680,7 +8680,7 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.get("/r/owner.js")
     def r_owner_js():
-        body = (TEMPLATE_DIR / "owner.js").read_text()
+        body = (TEMPLATE_DIR / "owner.js").read_text(encoding="utf-8")
         return Response(body, media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -11118,7 +11118,7 @@ def create_app(state: AppState) -> FastAPI:
         if not str(target).startswith(str(root.resolve())) \
                 or not target.is_file() or target.suffix != ".js":
             raise HTTPException(404, "no such file")
-        return Response(target.read_text(), media_type="application/javascript",
+        return Response(target.read_text(encoding="utf-8"), media_type="application/javascript",
                         # Immutable: the file is pinned by hash in a test,
                         # so a changed one is a changed application.
                         headers={"Cache-Control": "public, max-age=31536000, immutable"})
@@ -11131,14 +11131,14 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/node-wallet.js")
     def node_wallet_js():
         """The node's wallet behind the accounts' Wallet page (templates/node_wallet_js.js, 2026-10-19)."""
-        return Response((TEMPLATE_DIR / "node_wallet_js.js").read_text(),
+        return Response((TEMPLATE_DIR / "node_wallet_js.js").read_text(encoding="utf-8"),
                         media_type="application/javascript",
                         headers={"Cache-Control": "no-store"})
 
     @app.get("/node-mail.js")
     def node_mail_js():
         """The node's identity behind the accounts' Your arcade page (templates/node_mail_js.js, 2026-10-19)."""
-        return Response((TEMPLATE_DIR / "node_mail_js.js").read_text(),
+        return Response((TEMPLATE_DIR / "node_mail_js.js").read_text(encoding="utf-8"),
                         media_type="application/javascript",
                         headers={"Cache-Control": "no-store"})
 
@@ -20318,14 +20318,14 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/r/state.js")
     def r_state_js():
         """The page's half of game state: `arcade.state` (templates/state.js)."""
-        return Response((TEMPLATE_DIR / "state.js").read_text(),
+        return Response((TEMPLATE_DIR / "state.js").read_text(encoding="utf-8"),
                         media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
     @app.get("/r/escrow.js")
     def r_escrow_js():
         """The page's half of the escrow: `arcade.escrow` (templates/escrow.js)."""
-        return Response((TEMPLATE_DIR / "escrow.js").read_text(),
+        return Response((TEMPLATE_DIR / "escrow.js").read_text(encoding="utf-8"),
                         media_type="application/javascript",
                         headers={**contentlib.CORS, "Cache-Control": "public, max-age=3600"})
 
@@ -30135,15 +30135,19 @@ def create_app(state: AppState) -> FastAPI:
         if not who["local"]:
             return JSONResponse({"detail": "the arcade is restarted at the node machine"}, status_code=403)
         import signal
+        import sys
         supervisor = os.environ.get("ARCADE_SUPERVISOR_PID")
-        if supervisor:
+        if supervisor and sys.platform != "win32":
             # Run by the supervisor (arcade/web/supervisor.py): a reload -- the new worker gets ready beside this one,
-            # and nobody sees the arcade go down.
+            # and nobody sees the arcade go down. (Not on Windows: the supervisor is not supported there.)
             threading.Timer(1.0, lambda: os.kill(int(supervisor), signal.SIGHUP)).start()
             return JSONResponse({"ok": True})
         if not os.environ.get("INVOCATION_ID"):
             return JSONResponse({"detail": "this arcade is not run by a service that would start it again; "
                                            "restart it yourself"}, status_code=409)
+        if sys.platform == "win32":
+            return JSONResponse({"detail": "restart is not supported on Windows; restart the process yourself"},
+                                status_code=409)
         threading.Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         return JSONResponse({"ok": True})
 

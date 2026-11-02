@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .ssl_context import get_ssl_context
+
 log = logging.getLogger("arcade.coreinstall")
 
 
@@ -177,7 +179,8 @@ class Installer:
             archive = cores / (name + ".part")
             self._say(net, step="downloading", total=size)
             h = hashlib.sha256()
-            with urllib.request.urlopen(rel.url + name, timeout=60) as r, open(archive, "wb") as f:
+            with urllib.request.urlopen(rel.url + name, timeout=60, context=get_ssl_context()) as r, \
+                    open(archive, "wb") as f:
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
@@ -308,8 +311,12 @@ def start_installed(state) -> list[str]:
 
 def reload_arcade(home: Path) -> None:
     """The zero-downtime reload (web/supervisor.py): the new worker finds the chain's Core by its config."""
+    import sys
+    if sys.platform == "win32":
+        log.info("core install: supervisor reload not available on Windows; restart the arcade to use the new chain")
+        return
     try:
-        pid = int((Path(home) / "web-supervisor.pid").read_text().strip())
+        pid = int((Path(home) / "web-supervisor.pid").read_text(encoding="utf-8").strip())
         os.kill(pid, signal.SIGHUP)
     except (OSError, ValueError):
         log.info("core install: no supervisor to reload; the chain is read at the next restart")
