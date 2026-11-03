@@ -1049,6 +1049,12 @@ def create_app(state: AppState) -> FastAPI:
             _start_known_import()
         except Exception as exc:              # noqa: BLE001 -- never block startup
             log.info("known collections not started: %s", exc)
+        try:                                  # the Run your own page's download, packed now rather than on its first visit
+            # (2026-11-02: "/clone doesn't do anything" -- the first visit after every update packed the
+            # source while the page waited, 27 s on .25, and the browser gave up before it came)
+            threading.Thread(target=_packed_source, name="arcade-pack-source", daemon=True).start()
+        except Exception as exc:              # noqa: BLE001 -- never block startup
+            log.info("source not packed: %s", exc)
         try:                                  # mail for phones already subscribed
             push = state.push()
             if push is not None:              # notes every account's mail
@@ -1486,6 +1492,31 @@ def create_app(state: AppState) -> FastAPI:
         try:
             return seen_through(dict(getattr(operators, "peers", {}) or {}), links, mesh.node_id or "")
         except Exception:                                  # noqa: BLE001 -- the list is a nicety
+            return {}
+
+    def _chain_tags(peers: list[str]) -> dict[str, str]:
+        """The @name the chain gives each of these arcades (mesh keys), for the ones that say none themselves
+        (2026-11-02: a new operator on Windows claimed @dogefeed from the address that announces his arcade, and his
+        arcade still said no name, so every list showed only his mesh id). The name of the address that paid for the
+        arcade's mesh announcement (messaging/scanner.py: its fee address). Anybody can announce somebody else's key --
+        it only fails to connect -- so a key announced by more than one address gets no name. Display only, like the
+        name an arcade says itself."""
+        peers = [p for p in peers if p]
+        if not peers:
+            return {}
+        try:
+            chain = next(c for c in state.token_chains if c.network == state.messaging.network)
+            with state.store() as store:
+                senders = store.mesh_key_senders(state.messaging.network, peers)
+            index = state.token_index(chain)
+            out = {}
+            for peer, addresses in senders.items():
+                if len(addresses) == 1:
+                    tag = index.tag_of(next(iter(addresses))) or ""
+                    if tag:
+                        out[peer] = tag
+            return out
+        except Exception:                                  # noqa: BLE001 -- shown by mesh id
             return {}
 
     @app.get("/", response_class=HTMLResponse)
@@ -4432,6 +4463,35 @@ def create_app(state: AppState) -> FastAPI:
             state.flash(f"Could not add that: {exc}", "err")
         return RedirectResponse("/contacts/more", status_code=303)
 
+    def _claim_node_tag(tag: str) -> tuple[str, str]:
+        """Claim `tag` for the node's own address when it is not already its name: (the name, the claim's txid, or ""
+        when there was nothing to claim). Raises TagError / TokenError / ValueError with the reason."""
+        chain, index = _tag_chain()
+        if not state.unlocked:
+            state.ensure_identity()
+        home = state.derived_address
+        if not home:
+            raise taglib.TagError("this wallet has no identity address yet.")
+        asked = (tag or "").strip().lstrip("@")
+        current = index.tag_of(home) or ""
+        if not asked or asked.lower() == current.lower():
+            return current, ""
+        wanted = taglib.validate(asked)
+        holder = index.address_of(wanted)
+        if holder and holder != home:
+            raise taglib.TagError(f"@{wanted} is taken.")
+        if holder == home:
+            return wanted, ""
+        payload = P.AnyData(data=taglib.encode(wanted)).encode()
+        with chain.rpc() as rpc:
+            sender = tokenlib.TokenSender(rpc, chain.params)
+            prepared = sender.prepare(home, payload)
+            prepared.what = f"claim @{wanted}"
+            txid = sender.broadcast(prepared)
+        state.pending_tokens.append({"txid": txid, "what": f"claim @{wanted}", "at": time.time(),
+                                     "network": chain.network})
+        return wanted, txid
+
     @app.post("/publish", response_class=HTMLResponse)
     def publish_identity(request: Request, tag: str = Form(""),
                          csrf_token: str = Form("")):
@@ -4448,33 +4508,9 @@ def create_app(state: AppState) -> FastAPI:
         wins -- the card says before the button is pressed rather than after.
         """
         check_csrf(csrf_token)
-        chain, index = _tag_chain()
         wanted, claimed_txid = "", ""
         try:
-            if not state.unlocked:
-                state.ensure_identity()
-            home = state.derived_address
-            if not home:
-                raise taglib.TagError("this wallet has no identity address yet.")
-            asked = (tag or "").strip().lstrip("@")
-            current = index.tag_of(home) or ""
-            if asked and asked.lower() != current.lower():
-                wanted = taglib.validate(asked)
-                holder = index.address_of(wanted)
-                if holder and holder != home:
-                    raise taglib.TagError(f"@{wanted} is taken.")
-                if holder != home:
-                    payload = P.AnyData(data=taglib.encode(wanted)).encode()
-                    with chain.rpc() as rpc:
-                        sender = tokenlib.TokenSender(rpc, chain.params)
-                        prepared = sender.prepare(home, payload)
-                        prepared.what = f"claim @{wanted}"
-                        claimed_txid = sender.broadcast(prepared)
-                    state.pending_tokens.append(
-                        {"txid": claimed_txid, "what": f"claim @{wanted}",
-                         "at": time.time(), "network": chain.network})
-            else:
-                wanted = current
+            wanted, claimed_txid = _claim_node_tag(tag)
         except HTTPException:
             raise
         except (taglib.TagError, tokenlib.TokenError, ValueError) as exc:
@@ -4488,6 +4524,88 @@ def create_app(state: AppState) -> FastAPI:
         return publish_key(request, csrf_token=csrf_token, confirmed="yes",
                            say_tag=wanted or None, claimed=claimed_txid)
 
+    def _key_announcement(say_tag: str | None, claimed: str):
+        """The node's key announcement, prepared and not sent: (sender, prepared). Raises with the reason."""
+        # Publish WHO the key belongs to, not just the key. Without this the
+        # announcement is filed under whichever address funded it, which is
+        # not the address anyone was told to use.
+        home = state.derived_address or ""
+        try:
+            _, home_hash = b58check_decode(home) if home else (0, b"")
+        except HTTPException:
+            raise          # a rejected form is a 400, not an error page
+        except Exception:
+            home_hash = b""
+        # Key, this address, the same wallet's address on the other chain,
+        # and the @tag that address holds. The tag replaces the name a
+        # person typed: a reader can check a tag against the chain, and
+        # could only ever take a name on trust (D-032).
+        other_hash, tag = _announced_extras()
+        # The tag just claimed, when one was: the claim may not be in a
+        # block yet, so reading it back off the chain would announce the
+        # old name (or none) and the two statements would disagree until
+        # somebody published again. The announcement is this wallet's own
+        # statement; the claim transaction is what makes it true (D-076).
+        tag = say_tag if say_tag is not None else tag
+        # The picture goes out with the name and the addresses: one
+        # search then finds everything somebody needs to know about
+        # whoever holds that tag (D-138). Only if this wallet still holds
+        # the piece -- announcing one you have sold would be announcing
+        # somebody else's property.
+        face = _my_picture()
+        # This node's Dogecoin address too, when it runs Dogecoin (2026-10-15): anybody can pay it DOGE by @tag.
+        doge_hash = b""
+        try:
+            if getattr(state, "doge", None) is not None and state.doge in state.token_chains:
+                doge_hash = b58check_decode(state.home_address(state.doge))[1]
+        except Exception:
+            doge_hash = b""
+        payload = build_key_announcement(
+            state.identity.public_bytes, home_hash, "",
+            other_hash160=other_hash, tag=tag, pfp=face,
+            bio=str(state.setting("bio", "") or ""),
+            url=str(state.setting("url", "") or ""), doge_hash160=doge_hash, chains=_node_chain_hashes())
+        # A long name will not fit one OP_RETURN, so it goes as Class B --
+        # a couple of dust outputs rather than none. Better than publishing
+        # half a name, permanently, for the cheaper fee.
+        single_output = announcement_fits_one_output(payload)
+        with state.messaging.rpc() as rpc:
+            # Ask the CHAIN, not the store, whether this key is already
+            # published. The store can be wrong in the one direction that
+            # costs money: a reset dropped the announcement rows, the page
+            # said "None seen yet" and offered to publish again -- for
+            # something already permanent, and sitting below the new
+            # starting block where no rescan could ever find it.
+            existing = find_own_announcements(
+                rpc, state.messaging.params, state.identity.public_bytes)
+            if existing and not claimed:
+                # Refuse, and do NOT write the rows back. Restoring them
+                # would undo a reset the user asked for -- these are the
+                # very transactions they cleared. Knowing the announcement
+                # exists is what saves the fee; storing it again is a
+                # separate thing they did not ask for.
+                latest = existing[-1]
+                where = (f"in block {latest[2]:,}" if latest[2]
+                         else "and waiting for a block")
+                raise ValueError(
+                    f"this key is already published {where}, as {latest[0]}. "
+                    f"{len(existing)} announcement"
+                    f"{'' if len(existing) == 1 else 's'} for this key "
+                    f"{'is' if len(existing) == 1 else 'are'} already on the "
+                    f"chain, so there is nothing to pay for. It is not listed "
+                    f"below because this installation starts at a later block "
+                    f"-- that is the starting point doing its job, not a key "
+                    f"gone missing. Publishing again would cost a second fee "
+                    f"for a record that is already permanent."
+                )
+            if not Miner(rpc, state.messaging.params).status().funded:
+                raise ValueError("no spendable coins yet -- see Wallet")
+            sender = MessageSender(rpc, state.messaging.params)
+            prepared = sender.prepare(
+                funded_address(rpc, prefer=home), payload,
+                class_c=single_output, change_address=home)
+            return sender, prepared
+
     @app.post("/publish-key", response_class=HTMLResponse)
     def publish_key(request: Request, csrf_token: str = Form(""), confirmed: str = Form(""),
                     say_tag: str | None = None, claimed: str = ""):
@@ -4500,86 +4618,9 @@ def create_app(state: AppState) -> FastAPI:
                 # Nothing for the user to do but wait for the node; there is no
                 # passphrase to enter any more.
                 state.ensure_identity()
-            # Publish WHO the key belongs to, not just the key. Without this the
-            # announcement is filed under whichever address funded it, which is
-            # not the address anyone was told to use.
-            home = state.derived_address or ""
-            try:
-                _, home_hash = b58check_decode(home) if home else (0, b"")
-            except HTTPException:
-                raise          # a rejected form is a 400, not an error page
-            except Exception:
-                home_hash = b""
-            # Key, this address, the same wallet's address on the other chain,
-            # and the @tag that address holds. The tag replaces the name a
-            # person typed: a reader can check a tag against the chain, and
-            # could only ever take a name on trust (D-032).
-            other_hash, tag = _announced_extras()
-            # The tag just claimed, when one was: the claim may not be in a
-            # block yet, so reading it back off the chain would announce the
-            # old name (or none) and the two statements would disagree until
-            # somebody published again. The announcement is this wallet's own
-            # statement; the claim transaction is what makes it true (D-076).
-            tag = say_tag if say_tag is not None else tag
-            # The picture goes out with the name and the addresses: one
-            # search then finds everything somebody needs to know about
-            # whoever holds that tag (D-138). Only if this wallet still holds
-            # the piece -- announcing one you have sold would be announcing
-            # somebody else's property.
-            face = _my_picture()
-            # This node's Dogecoin address too, when it runs Dogecoin (2026-10-15): anybody can pay it DOGE by @tag.
-            doge_hash = b""
-            try:
-                if getattr(state, "doge", None) is not None and state.doge in state.token_chains:
-                    doge_hash = b58check_decode(state.home_address(state.doge))[1]
-            except Exception:
-                doge_hash = b""
-            payload = build_key_announcement(
-                state.identity.public_bytes, home_hash, "",
-                other_hash160=other_hash, tag=tag, pfp=face,
-                bio=str(state.setting("bio", "") or ""),
-                url=str(state.setting("url", "") or ""), doge_hash160=doge_hash, chains=_node_chain_hashes())
-            # A long name will not fit one OP_RETURN, so it goes as Class B --
-            # a couple of dust outputs rather than none. Better than publishing
-            # half a name, permanently, for the cheaper fee.
-            single_output = announcement_fits_one_output(payload)
-            with state.messaging.rpc() as rpc:
-                # Ask the CHAIN, not the store, whether this key is already
-                # published. The store can be wrong in the one direction that
-                # costs money: a reset dropped the announcement rows, the page
-                # said "None seen yet" and offered to publish again -- for
-                # something already permanent, and sitting below the new
-                # starting block where no rescan could ever find it.
-                existing = find_own_announcements(
-                    rpc, state.messaging.params, state.identity.public_bytes)
-                if existing and not claimed:
-                    # Refuse, and do NOT write the rows back. Restoring them
-                    # would undo a reset the user asked for -- these are the
-                    # very transactions they cleared. Knowing the announcement
-                    # exists is what saves the fee; storing it again is a
-                    # separate thing they did not ask for.
-                    latest = existing[-1]
-                    where = (f"in block {latest[2]:,}" if latest[2]
-                             else "and waiting for a block")
-                    raise ValueError(
-                        f"this key is already published {where}, as {latest[0]}. "
-                        f"{len(existing)} announcement"
-                        f"{'' if len(existing) == 1 else 's'} for this key "
-                        f"{'is' if len(existing) == 1 else 'are'} already on the "
-                        f"chain, so there is nothing to pay for. It is not listed "
-                        f"below because this installation starts at a later block "
-                        f"-- that is the starting point doing its job, not a key "
-                        f"gone missing. Publishing again would cost a second fee "
-                        f"for a record that is already permanent."
-                    )
-                if not Miner(rpc, state.messaging.params).status().funded:
-                    raise ValueError("no spendable coins yet -- see Wallet")
-                sender = MessageSender(rpc, state.messaging.params)
-                prepared = sender.prepare(
-                    funded_address(rpc, prefer=home), payload,
-                    class_c=single_output, change_address=home)
-                if confirmed == "yes":
-                    txid = sender.broadcast(prepared)
+            sender, prepared = _key_announcement(say_tag, claimed)
+            if confirmed == "yes":
+                txid = sender.broadcast(prepared)
         except HTTPException:
             raise          # a rejected form is a 400, not an error page
         except Exception as exc:
@@ -10371,6 +10412,60 @@ def create_app(state: AppState) -> FastAPI:
                "/exchange": 0 if _account_view(request) else _offers_waiting()}
         return JSONResponse({k: int(v or 0) for k, v in out.items()}, headers={"Cache-Control": "no-store"})
 
+    @app.get("/dogefeedx/api/local/notifications")
+    def dogefeedx_local_notifications(request: Request):
+        """Likes, comments, reposts, sales and offers for this arcade account.
+
+        Read from the node's own notification book. Empty when nobody is signed in.
+        Nothing here is written to dogefeed.app.
+        """
+        account = signed_in(request)
+        if account is None and _account_view(request):
+            return JSONResponse({"signed_in": False, "items": []}, headers={"Cache-Control": "no-store"})
+        try:
+            events = _notif_events(account) if account is not None else _node_notif_events()
+        except Exception:                                 # noqa: BLE001 -- an empty list, not a made-up one
+            events = []
+
+        def bucket(ev) -> str:
+            kind = ev.kind or ""
+            if kind == "liked":
+                return "likes"
+            if kind == "replied to":
+                return "comments"
+            if kind == "shared":
+                return "reposts"
+            if kind == "sold":
+                return "market_sale"
+            if kind == "bought":
+                return "market_purchase"
+            if ev.source == "fill":
+                return "offer_received"
+            return ""
+
+        items = []
+        for ev in list(events)[:100]:
+            which = bucket(ev)
+            if not which:
+                continue
+            items.append({"bucket": which, "kind": ev.kind, "text": ev.text or "",
+                          "unread": bool(ev.unread), "at": int(ev.at or 0)})
+        return JSONResponse({"signed_in": True, "items": items}, headers={"Cache-Control": "no-store"})
+
+    @app.get("/dogefeedx/api/local/games")
+    def dogefeedx_local_games(request: Request):
+        """Games inscribed on this arcade. Identity is the player's on-chain account. Empty when there are none."""
+        try:
+            rows = _games_ranked(request, "popular")
+        except Exception:                                 # noqa: BLE001
+            rows = []
+        games = []
+        for row in rows[:60]:
+            name = row.get("name") or ""
+            if name:
+                games.append({"name": name, "txid": row.get("txid") or "", "net": row.get("netlabel") or ""})
+        return JSONResponse({"games": games, "identity": "on-chain"}, headers={"Cache-Control": "no-store"})
+
     @app.get("/home", response_class=HTMLResponse)
     def home_screen(request: Request):
         """The installed app's one page (PWA only): the tabs and the apps as icons, each opened full screen over it
@@ -10402,7 +10497,7 @@ def create_app(state: AppState) -> FastAPI:
                 "by": ("@" + who) if who else it["creator"][:12] + "…", "address": it["creator"],
                 "version": str(g.get("version") or "")[:24], "players": str(g.get("players") or "")[:40],
                 "likes": it.get("likes", 0), "comments": it.get("comments", 0),
-                "perms": [p for p in ("wallet", "contacts", "groups", "media", "notify") if g.get(p)],
+                "perms": [p for p in ("wallet", "contacts", "groups", "media", "pictures", "notify") if g.get(p)],
                 "timeout": g.get("minimized_timeout"),
             })
         return apps
@@ -10430,6 +10525,48 @@ def create_app(state: AppState) -> FastAPI:
                       coins=coins, system=system, operator_view=not _account_view(request))
 
     # ---------- DogeFeedX Terminal API: safe whitelist of read-only commands ----------
+    #: Commands a signed-in account, or the operator at this machine, may ask a minute.
+    #: A stranger on the public address is refused by the route (the door still lets a signed-in account through).
+    DFX_COMMANDS_A_MINUTE = 30
+    _dfx_seen: dict[str, list[float]] = {}
+
+    def _dfx_visitor(request: Request) -> str:
+        return (request.headers.get("cf-connecting-ip")
+                or (request.headers.get("x-forwarded-for") or "").split(",")[0]
+                or (request.client.host if request.client else "")).strip() or "local"
+
+    def _dfx_at_the_machine(request: Request) -> bool:
+        """The operator sitting at this arcade: the same door Admin → Overview uses."""
+        return not (state.public or _from_outside(request))
+
+    def _dfx_may_ask(request: Request) -> bool:
+        """A signed-in account, or the operator on this machine."""
+        return _dfx_at_the_machine(request) or signed_in(request) is not None
+
+    def _dfx_limited(request: Request) -> bool:
+        who = _dfx_visitor(request)
+        now = time.monotonic()
+        times = [t for t in _dfx_seen.get(who, ()) if now - t < 60]
+        if len(times) >= DFX_COMMANDS_A_MINUTE:
+            _dfx_seen[who] = times
+            return True
+        times.append(now)
+        _dfx_seen[who] = times
+        if len(_dfx_seen) > 5000:
+            for key in [k for k, seen in _dfx_seen.items() if not seen or now - seen[-1] > 60]:
+                _dfx_seen.pop(key, None)
+        return False
+
+    def _dfx_refused(request: Request):
+        if not _dfx_may_ask(request):
+            return JSONResponse({"detail": "Sign in first.", "output": "Sign in first."},
+                                status_code=403)
+        if _dfx_limited(request):
+            return JSONResponse({"detail": "Too many commands in a minute.",
+                                 "output": "Too many commands in a minute."},
+                                status_code=429)
+        return None
+
     TERMINAL_COMMANDS = {
         "help": "Show available commands",
         "status": "Show node status and version",
@@ -10453,11 +10590,16 @@ def create_app(state: AppState) -> FastAPI:
     @app.post("/api/terminal/exec")
     def terminal_exec(request: Request, payload: Any = Body(None)):
         """Execute a terminal command. Commands are limited to safe, read-only operations.
-        
-        This endpoint is public but restricted to a whitelist of commands that only read data.
-        It does NOT provide arbitrary shell or RPC access. Admin-only actions (like sending,
-        signing, or changing settings) are not available here.
+
+        A signed-in account, or the operator on this machine, may ask. A stranger is refused
+        (403). Thirty commands a minute, then 429. The whitelist only reads data. It does
+        NOT provide arbitrary shell or RPC access. Admin-only actions (sending, signing,
+        or changing settings) are not available here. A reply never includes Core's own
+        error text.
         """
+        refused = _dfx_refused(request)
+        if refused is not None:
+            return refused
         said = payload if isinstance(payload, dict) else {}
         cmd = str(said.get("command", "")).strip()
         args = [a.strip() for a in str(said.get("args", "")).split() if a.strip()]
@@ -10506,6 +10648,13 @@ def create_app(state: AppState) -> FastAPI:
                 return JSONResponse({"output": "\n".join(lines)})
             
             if cmd == "peers":
+                # Mesh links are the operator's, the same rule as Admin → Overview:
+                # this machine only. A signed-in account from outside is not shown them.
+                if not _dfx_at_the_machine(request):
+                    return JSONResponse(
+                        {"detail": "Peers are on this machine, under Admin → Overview.",
+                         "output": "Peers are on this machine, under Admin → Overview."},
+                        status_code=403)
                 mesh = getattr(state, "mesh", None)
                 if not mesh or not hasattr(mesh, "node"):
                     return JSONResponse({"output": "Mesh not available."})
@@ -10550,11 +10699,12 @@ def create_app(state: AppState) -> FastAPI:
                 if not chain:
                     return JSONResponse({"output": f"Unknown chain: {chain_name}. Use 'chains' to see available chains."})
                 try:
-                    if block_ref.isdigit():
-                        block_hash = chain.rpc("getblockhash", int(block_ref))
-                    else:
-                        block_hash = block_ref
-                    block = chain.rpc("getblock", block_hash)
+                    with chain.rpc() as rpc:
+                        if block_ref.isdigit():
+                            block_hash = rpc.call("getblockhash", int(block_ref))
+                        else:
+                            block_hash = block_ref
+                        block = rpc.call("getblock", block_hash)
                     lines = [
                         f"Block {block.get('height', '?')}",
                         f"  Hash: {block.get('hash', '?')[:32]}...",
@@ -10563,8 +10713,9 @@ def create_app(state: AppState) -> FastAPI:
                         f"  Size: {block.get('size', '?')} bytes",
                     ]
                     return JSONResponse({"output": "\n".join(lines)})
-                except Exception as e:
-                    return JSONResponse({"output": f"Error looking up block: {e}"})
+                except Exception:
+                    log.debug("terminal block lookup failed", exc_info=True)
+                    return JSONResponse({"output": "Could not look up that block."})
             
             if cmd == "tx":
                 if len(args) < 2:
@@ -10574,7 +10725,8 @@ def create_app(state: AppState) -> FastAPI:
                 if not chain:
                     return JSONResponse({"output": f"Unknown chain: {chain_name}. Use 'chains' to see available chains."})
                 try:
-                    tx = chain.rpc("getrawtransaction", txid, True)
+                    with chain.rpc() as rpc:
+                        tx = rpc.call("getrawtransaction", txid, True)
                     lines = [
                         f"Transaction {txid[:32]}...",
                         f"  Confirmations: {tx.get('confirmations', 0)}",
@@ -10585,8 +10737,9 @@ def create_app(state: AppState) -> FastAPI:
                     if tx.get("blockhash"):
                         lines.append(f"  Block: {tx.get('blockhash')[:32]}...")
                     return JSONResponse({"output": "\n".join(lines)})
-                except Exception as e:
-                    return JSONResponse({"output": f"Error looking up transaction: {e}"})
+                except Exception:
+                    log.debug("terminal transaction lookup failed", exc_info=True)
+                    return JSONResponse({"output": "Could not look up that transaction."})
             
             if cmd == "address":
                 if len(args) < 2:
@@ -10597,16 +10750,20 @@ def create_app(state: AppState) -> FastAPI:
                     return JSONResponse({"output": f"Unknown chain or not indexed: {chain_name}"})
                 try:
                     index = state.token_index(chain)
-                    with contextlib.closing(index.open()) as db:
-                        balance = index.balance(db, addr)
+                    held = index.balances([addr])
                     lines = [
                         f"Address: {addr[:20]}...",
                         f"  Chain: {chain.label}",
-                        f"  Balance: {format_amount(balance)} {chain.params.coin}",
                     ]
+                    if not held:
+                        lines.append("  No tokens.")
+                    else:
+                        for row in held:
+                            lines.append(f"  {row.get('name')}: {row.get('display')}")
                     return JSONResponse({"output": "\n".join(lines)})
-                except Exception as e:
-                    return JSONResponse({"output": f"Error looking up address: {e}"})
+                except Exception:
+                    log.debug("terminal address lookup failed", exc_info=True)
+                    return JSONResponse({"output": "Could not look up that address."})
             
             if cmd == "inscription":
                 if not args:
@@ -10641,24 +10798,26 @@ def create_app(state: AppState) -> FastAPI:
                 return JSONResponse({"output": "", "clear": True})
             
             return JSONResponse({"error": "not implemented", "output": f"Command '{cmd}' is not yet implemented."})
-        
-        except Exception as e:
-            return JSONResponse({"error": str(e), "output": f"Error: {e}"})
+
+        except Exception:
+            log.debug("terminal command failed", exc_info=True)
+            return JSONResponse({"error": "That command could not be run.",
+                                 "output": "That command could not be run."})
 
     # ---------- DogeFeedX Network API: public network status endpoint ----------
     @app.get("/api/network")
-    def api_network_status():
-        """Public network status for the DogeFeedX Network window.
-        
-        Returns safe, non-sensitive network information including:
-        - Chain sync status with progress bars
-        - Connected peers count
-        - Node status
-        - Tunnel status (if available)
-        
-        This endpoint is public and does not require authentication.
-        Sensitive information (like full peer lists or admin details) is not included.
+    def api_network_status(request: Request):
+        """Network status for the DogeFeedX Network window.
+
+        A signed-in account, or the operator on this machine. A stranger is refused
+        (403), and thirty asks a minute (429). The reply has chain sync, whether the
+        mesh is up, and a peer count. It does not send the node id, the tunnel's name,
+        or a list of arcades (that list was always empty). `tunnel` is `{active}` and
+        `arcades` is `[]`, which is what the window reads.
         """
+        refused = _dfx_refused(request)
+        if refused is not None:
+            return refused
         chains = []
         for c in state.all_chains:
             try:
@@ -10687,34 +10846,23 @@ def create_app(state: AppState) -> FastAPI:
         mesh_status = {"connected": False, "peers": 0}
         if mesh is not None and getattr(mesh, "loop", None) is not None:
             mesh_status["connected"] = True
-            mesh_status["node_id"] = str(getattr(mesh, "node_id", "") or "")[:16]
             if hasattr(mesh, "node") and hasattr(mesh.node, "links"):
                 mesh_status["peers"] = len(mesh.node.links)
             stun = getattr(mesh, "stun", None)
             if stun is not None:
                 mesh_status["stun_servers"] = len(stun.mine())
-        
-        tunnel = {"active": False, "name": None}
+
+        tunnel = {"active": False}
         try:
             tunnel_state = state.setting("tunnel", {})
             if isinstance(tunnel_state, dict) and tunnel_state.get("active"):
                 tunnel["active"] = True
-                tunnel["name"] = tunnel_state.get("name", "")
         except Exception:
             pass
-        
-        arcades = []
-        try:
-            running = _arcades_running()
-            for arc in running[:10]:
-                arcades.append({
-                    "id": str(arc.get("id", ""))[:16],
-                    "name": arc.get("name", ""),
-                    "linked": arc.get("link", {}).get("state") == "linked",
-                })
-        except Exception:
-            pass
-        
+
+        # The window reads `arcades`. The old list sliced a dict and was always empty.
+        arcades: list = []
+
         return JSONResponse({
             "chains": chains,
             "mesh": mesh_status,
@@ -26329,6 +26477,7 @@ def create_app(state: AppState) -> FastAPI:
                 said = {"game": True, "card": card["txid"], "name": card["game"]["name"],
                         "wallet": bool(card["game"].get("wallet")),
                         "media": bool(card["game"].get("media")),
+                        "pictures": bool(card["game"].get("pictures")),
                         "contacts": bool(card["game"].get("contacts")),
                         "groups": bool(card["game"].get("groups")),
                         "opens": _game_opens(ix, creator, card["txid"], card["game"]),
@@ -29969,7 +30118,8 @@ def create_app(state: AppState) -> FastAPI:
                 text = str(said["faucet_daily"]).strip()
                 state.set_setting("faucet_daily",
                                   None if text in ("", "none") else walletlib.parse_amount(text))
-            for flag in ("auto_update", "auto_sell", "auto_fill", "node_trades", termslib.GATE_SETTING):
+            for flag in ("auto_update", "auto_sell", "auto_fill", "node_trades", termslib.GATE_SETTING,
+                         "serve_index_copies", "fetch_index_copies"):
                 if flag in said:
                     state.set_setting(flag, bool(said[flag]))
             if termslib.TEXT_SETTING in said:
@@ -30143,6 +30293,19 @@ def create_app(state: AppState) -> FastAPI:
                 chains.append(state.addon(net) or ChainContext(network=net, role="ledger", label=params.label))
         return chains
 
+    def _coverage_rows(mesh) -> list[dict]:
+        cov = getattr(mesh, "coverage", None)
+        try:
+            rows = cov.status() if cov is not None else []
+        except Exception:                                  # noqa: BLE001 -- never takes the panel down
+            return []
+        labels = {c.network: c.label for c in getattr(state, "all_chains", ())}
+        for r in rows:
+            kind, _, net = r["key"].partition(":")
+            r["what"] = {"c": "Core", "o": "Ord index", "t": "Token index", "m": "Media relay",
+                         "g": "Game room"}.get(kind, kind) + (f": {labels.get(net, net)}" if net and kind != "g" else "")
+        return [r for r in rows if not r["key"].startswith("g:")] + [r for r in rows if r["key"].startswith("g:")]
+
     def _admin_chains() -> dict:
         """Admin -> Chains (arcade/cores.py): which Cores run here, which are borrowed through the
         mesh, which are shared, and how this arcade's indexes compare with other arcades'."""
@@ -30158,8 +30321,17 @@ def create_app(state: AppState) -> FastAPI:
                 row["chosen"] = coreslib.mode(state.settings(), row["net"], coreslib.OFF)
         index = check.status() if check else {}
         from .. import core_catchup
+        tokens = {c.network: c for c in state.token_chains}
         for row in rows:
             row["index"] = index.get(row["net"], {})
+            # Index copies (ledger_snapshot.py, 2026-11-02): one made for others, one being fetched, or where this
+            # index came from and how far its confirmation from this arcade's own node has got.
+            row["copy"] = None
+            if row["net"] in tokens and hasattr(state, "ledger_snapshots"):
+                try:
+                    row["copy"] = state.ledger_snapshots(tokens[row["net"]]).status()
+                except Exception:                          # noqa: BLE001 -- never takes the panel down
+                    row["copy"] = None
             # A Core here that is behind (syncing, re-indexing, rescanning): read from a sharer until it catches up,
             # or used as it is when none shares the chain, said in one line (arcade/core_catchup.py, 2026-10-21).
             own = state.messaging if row["net"] == state.messaging.network else (
@@ -30197,7 +30369,13 @@ def create_app(state: AppState) -> FastAPI:
                          if net not in NETWORKS and s.get("sharers"))
         return {"rows": rows, "mesh": mesh is not None, "unknown": unknown,
                 "restart": bool(os.environ.get("INVOCATION_ID") or os.environ.get("ARCADE_SUPERVISOR_PID")),
-                "mining": _mining_json()}
+                "mining": _mining_json(),
+                # Index copies (ledger_snapshot.py, 2026-11-02): serve them to arcades far behind, and fetch
+                # one when this index is. Both on unless turned off (a phone turns serving off).
+                "copies": {"serve": state.setting("serve_index_copies", True) is not False,
+                           "fetch": state.setting("fetch_index_copies", True) is not False},
+                # What this arcade needs and how many linked arcades hold each (mesh/coverage.py, 2026-11-02).
+                "coverage": _coverage_rows(mesh)}
 
     def _admin_faucet_row(net: str) -> dict | None:
         """A test chain's faucet for Admin -> Chains (2026-10-18): its daily top-off, how it is stocked,
@@ -30530,6 +30708,154 @@ def create_app(state: AppState) -> FastAPI:
         except Exception:                                  # noqa: BLE001 -- kept here; the next link-up passes it on
             log.info("welcome: could not pass a record on now", exc_info=True)
 
+    # --- the new operator's setup wizard (_setup_wizard.html, 2026-11-02) ------------------------------------
+    #: The names index counts as current within this many blocks of the node: a name is checked against it.
+    SETUP_INDEX_CURRENT = 6
+
+    def _setup_state() -> dict:
+        """Everything the setup wizard shows, in its four steps: the node, PEP test, the @name, and the name going out.
+        `need` is whether it shows at all: this arcade's operator has no @name on the chain yet."""
+        from . import welcoming
+        from .. import core_catchup
+        from ..messaging.sender import fundable_output
+        chain = state.messaging
+        tag = ""
+        try:
+            tag = state.operator_tag() or ""
+        except Exception:                                  # noqa: BLE001 -- said as none
+            tag = ""
+        out: dict[str, Any] = {"need": not tag, "tag": tag, "net": chain.network, "label": chain.label,
+                               "operator_is_node": not getattr(state, "operator", None)}
+        # 1. The node, and whether the chain is borrowed meanwhile.
+        try:
+            sync = state.chain_sync(chain)
+        except Exception:                                  # noqa: BLE001
+            sync = {"ready": False, "progress": 0.0, "online": False}
+        try:
+            catchup = core_catchup.say(chain, mesh_on=getattr(state, "mesh", None) is not None)
+        except Exception:                                  # noqa: BLE001
+            catchup = None
+        out["node"] = {**{k: sync.get(k) for k in ("ready", "progress", "blocks", "headers", "online")},
+                       "borrowed": bool(getattr(chain, "borrowed", False)), "catchup": catchup}
+        # The names index: what a name is checked against before it is claimed.
+        index = state.token_index(chain)
+        indexed = int(index.indexed_height() or 0)
+        tip = state.ledger_tips.get(chain.network) or int(sync.get("headers") or 0) or None
+        copy = None
+        try:
+            copy = state.ledger_snapshots(chain).status()
+        except Exception:                                  # noqa: BLE001
+            copy = None
+        out["index"] = {"indexed": indexed, "tip": tip,
+                        "current": bool(tip) and indexed >= int(tip) - SETUP_INDEX_CURRENT,
+                        "copy": copy}
+        # 2. PEP test: the address to send to, what the chain says it holds, and what this node's wallet can spend.
+        address = welcoming.my_address(state)
+        coins = {"address": address, "on_chain": 0, "spendable": 0, "mined": 0, "arrived_at": None}
+        if address:
+            try:
+                coins["on_chain"] = welcoming.address_coins(state, address)
+                with index.open() as db:
+                    row = db.conn.execute("SELECT MIN(height) FROM utxo WHERE address=?", (address,)).fetchone()
+                coins["arrived_at"] = int(row[0]) if row and row[0] else None
+            except Exception:                              # noqa: BLE001
+                pass
+            try:
+                with chain.rpc() as rpc:
+                    for u in rpc.call("listunspent", 0, 9_999_999, [address]):
+                        value = int(round(float(u.get("amount") or 0) * 100_000_000))
+                        coins["spendable" if fundable_output(u, chain.params) else "mined"] += value
+            except Exception as exc:                       # noqa: BLE001 -- a node warming up: said so
+                coins["wallet_error"] = str(exc)[:160]
+        out["coins"] = coins
+        try:
+            book, key, _ = _welcome()
+            out["welcome"] = (welcoming.view(state, book, key) or {}).get("mine")
+        except Exception:                                  # noqa: BLE001
+            out["welcome"] = None
+        # 3 and 4. A claim on its way: one this node really broadcast, waiting for its block.
+        out["claiming"] = None
+        for item in reversed(state.pending_tokens):
+            what = str(item.get("what") or "")
+            if item.get("network") == chain.network and what.startswith("claim @"):
+                out["claiming"] = {"tag": what[len("claim @"):], "txid": item.get("txid") or "",
+                                   "at": int(item.get("at") or 0)}
+                break
+        # Why the Claim button is off, in order (empty: it is on).
+        why = ""
+        if out["claiming"]:
+            why = "claimed"
+        elif not out["operator_is_node"]:
+            why = "operator account"
+        elif not out["index"]["current"]:
+            why = "index"
+        elif coins["spendable"] <= 0:
+            if coins["mined"] > 0:
+                why = "mined"
+            elif coins["on_chain"] > 0 and coins["arrived_at"] and int(sync.get("blocks") or 0) < coins["arrived_at"]:
+                why = "node behind coins"
+            else:
+                why = "no coins"
+        out["blocked"] = why
+        return out
+
+    @app.get("/admin/api/setup")
+    def admin_setup(request: Request):
+        """The new operator's setup wizard (2026-11-02): shown while this arcade's operator has no @name."""
+        _admin_check(request)
+        return JSONResponse(_setup_state(), headers={"Cache-Control": "no-store"})
+
+    @app.get("/admin/api/setup/name")
+    def admin_setup_name(request: Request, tag: str = ""):
+        """Is this @name one that can be claimed, and is it free (against the names index)?"""
+        _admin_check(request)
+        index = state.token_index(state.messaging)
+        try:
+            wanted = taglib.validate((tag or "").strip().lstrip("@"))
+        except taglib.TagError as exc:
+            return JSONResponse({"valid": False, "why": str(exc)})
+        holder = index.address_of(wanted)
+        mine = holder is not None and holder == state.derived_address
+        return JSONResponse({"valid": True, "tag": wanted, "taken": bool(holder) and not mine, "mine": mine},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/admin/api/setup/claim")
+    def setup_claim(request: Request, payload: Any = Body(None)):
+        """The wizard's one button (2026-11-02: "claim and publish should be the same thing"): claim the @name
+        for the node's own address and publish its key with it. {tag} -> {tag, claimed, published}: the real txids,
+        or a 400 with the reason -- never "on its way" for something that did not go."""
+        _admin_check(request, write=True)
+        said = payload if isinstance(payload, dict) else {}
+        now = _setup_state()
+        if now["blocked"] == "claimed":
+            raise HTTPException(400, f"@{now['claiming']['tag']} is already on its way, waiting for its block")
+        if now["blocked"]:
+            reasons = {"operator account": "this arcade's operator is an account: claim the name from its Your arcade",
+                       "index": "the names index is still catching up, so the name cannot be checked yet",
+                       "mined": "only mined coins are here, and a name cannot be paid for with those yet",
+                       "node behind coins": "your node has not reached the block your PEP test arrived in yet",
+                       "no coins": "this arcade has no PEP test yet"}
+            raise HTTPException(400, reasons.get(now["blocked"], now["blocked"]))
+        try:
+            if not str(said.get("tag") or "").strip().lstrip("@"):
+                raise taglib.TagError("type the name first")
+            wanted, claimed = _claim_node_tag(str(said.get("tag") or ""))
+        except HTTPException:
+            raise
+        except (taglib.TagError, tokenlib.TokenError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from None
+        except Exception as exc:                           # noqa: BLE001 -- said, not a 500
+            raise HTTPException(400, f"{exc.__class__.__name__}: {exc}") from None
+        # The key goes with the name. If it cannot go now, the claim is still out: said, with its txid.
+        published, publish_error = "", ""
+        try:
+            sender, prepared = _key_announcement(wanted, claimed)
+            published = sender.broadcast(prepared)
+        except Exception as exc:                           # noqa: BLE001
+            publish_error = str(exc)[:300]
+        return JSONResponse({"tag": wanted, "claimed": claimed, "published": published,
+                             "publish_error": publish_error})
+
     @app.get("/admin/api/welcome")
     def admin_welcome(request: Request):
         """Admin -> Overview's Welcome panel and the first-run sheet (2026-10-27, arcade/welcome.py): this arcade's
@@ -30581,7 +30907,8 @@ def create_app(state: AppState) -> FastAPI:
         Where each piece comes from, and what can be known:
           * @name and host: this arcade's from state.operator_tag() and public_hosts; another's from what it said on
             its link (mesh/operators.py "me", checked for a tag's shape there) -- display only, never trusted for
-            anything. An arcade that never said one (older, or not linked since this one started) shows its mesh id.
+            anything. An arcade that says none gets the @name of the one address that announced its mesh key on the
+            chain (`_chain_tags`, `tag_from: "chain"`); with none of those, it shows its mesh id.
           * Cores: this arcade's own, each chain it runs here (not borrowed), `shared` when the mesh offers it now
             (coreshare.status "sharing"; its Share box in Coins -> Chains is `switch`). Another arcade's only as far
             as it shares them (coreshare.offers, linked arcades): a Core it runs and does not share is not told.
@@ -30676,6 +31003,8 @@ def create_app(state: AppState) -> FastAPI:
                  "lora": bool(getattr(getattr(state, "lora", None), "running", False)),
                  "ords": ords.get(me or "this arcade", []), "link": {"state": "me"}}]
         order = {n: i for i, n in enumerate(NETWORKS)}      # the chains in the order the arcade lists them
+        on_chain = _chain_tags([p for p in running["ids"]
+                                if not (said.get(p) or {}).get("tag") and not (via.get(p) or {}).get("tag")])
         others = []
         for peer in running["ids"]:
             heard = said.get(peer) or {}
@@ -30689,7 +31018,9 @@ def create_app(state: AppState) -> FastAPI:
             else:
                 link = {"state": "none"}
             seen = via.get(peer) or {}
-            others.append({"me": False, "node": peer[:12], "tag": heard.get("tag") or seen.get("tag") or "",
+            others.append({"me": False, "node": peer[:12],
+                           "tag": heard.get("tag") or seen.get("tag") or on_chain.get(peer) or "",
+                           **({"tag_from": "chain"} if peer in on_chain else {}),
                            "host": (heard.get("hosts") or [seen.get("host") or ""])[0],
                            "lora": bool(heard.get("lora")),
                            "cores": [{**coin(n), "shared": True}
@@ -31070,16 +31401,26 @@ def create_app(state: AppState) -> FastAPI:
     # any node can be the place somebody installs from with no new option to
     # point at one.
 
-    def _packed_source():
-        """This instance's own source, packed if it has not been."""
-        said = bootstraplib.source(state.home)
+    packing = threading.Lock()
+
+    def _packed_source(wait: bool = True):
+        """This instance's own source, packed if it has not been. One pack at a time: started at startup, and a
+        download asking meanwhile waits for that one rather than packing a second beside it. With `wait` False (the
+        page), "packing" while one runs: the page answers at once and says to come back in a minute."""
         revision = state.running_version or "unknown"
-        if said is None or said.get("revision") != revision:
-            try:
-                said = bootstraplib.source_archive(
-                    state.home, state.checkout, revision)
-            except bootstraplib.BootstrapError:
-                return None
+        said = bootstraplib.source(state.home)
+        if said is not None and said.get("revision") == revision:
+            return said
+        if not wait and packing.locked():
+            return "packing"
+        with packing:
+            said = bootstraplib.source(state.home)
+            if said is None or said.get("revision") != revision:
+                try:
+                    said = bootstraplib.source_archive(
+                        state.home, state.checkout, revision)
+                except bootstraplib.BootstrapError:
+                    return None
         return said
 
     def _served_bootstrap(network: str):
@@ -31151,7 +31492,9 @@ def create_app(state: AppState) -> FastAPI:
                 snapshot = None
             if snapshot is not None:
                 copies.append({"chain": context, "snap": snapshot})
-        return render(request, "clone.html", source=_packed_source(),
+        source = _packed_source(wait=False)
+        return render(request, "clone.html", source=None if source == "packing" else source,
+                      packing=source == "packing",
                       copies=copies, here=_origin(request), first_peer=_install_peer(request),
                       seats=state.accounts().seats)
 
@@ -35355,6 +35698,12 @@ def create_app(state: AppState) -> FastAPI:
     llmweb.register(app, state, signed_in=signed_in, account_address=_account_address, account_chain=_account_chain,
                     admin_check=_admin_check, name_of=_name_of,
                     pay_choices=lambda request: _pair_choices(request, "nobody", everything=True), render=render)
+    # DogeFeedX apps: Explorer and Terminal apps with Mac OS X Aqua styling and DogeFeed branding.
+    from . import dogefeedx
+    dogefeedx.register_routes(app, render)
+    # DogeFeedX Network app: node status, sync progress, and mesh peers.
+    from .dogefeedx import network as dogefeedx_network
+    dogefeedx_network.register(app, state, admin_check=_admin_check)
     return app
 
 
